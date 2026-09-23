@@ -1,0 +1,18 @@
+{
+    "id": "weatherArt",
+    "name": "Weather Art",
+    "description": "Dynamic weather art widget",
+    "version": "0.1.0",
+    "author": "viewerofall",
+    "type": "desktop",
+    "capabilities": ["desktop-widget"],
+    "component": "./WeatherArtWidget.qml",
+    "icon": "cloud",
+    "settings": "./WeatherArtSettings.qml",
+    "requires_dms": ">=1.2.0",
+    "permissions": [
+        "settings_read",
+        "settings_write"
+    ],
+    "repo": "viewerofall-labs/weather-viewer/weatherArt"
+}

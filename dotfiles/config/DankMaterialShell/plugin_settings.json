@@ -1,0 +1,18 @@
+{
+  "screenRecorder": {
+    "enabled": true,
+    "captureSource": "screen",
+    "audioMode": "system",
+    "fps": "60",
+    "quality": "very_high"
+  },
+  "dankDesktopWeather": {
+    "enabled": true
+  },
+  "mediaPlayer": {
+    "enabled": true
+  },
+  "dankAudioVisualizer": {
+    "enabled": true
+  }
+}

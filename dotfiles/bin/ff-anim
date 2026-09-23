@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+"""Приветствие в стиле neofetch: логотип Arch Linux без остановки крутится в 3D, справа — инфа.
+
+Сначала рисуется вся картинка и сразу появляется prompt, а вращение продолжает фоновый
+процесс поверх своего же места на экране. При изменении размера окна приветствие
+перерисовывается, и вращение продолжается. fish гасит процесс перед первой командой
+(см. __ff_anim_stop в config.fish) — после этого вывод уезжает вверх и крутить нечего.
+
+Переменные: FF_ANIM=0 — без анимации, FF_ANIM_TIME — секунд на оборот (по умолчанию 4).
+"""
+import math
+import os
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import threading
+import time
+
+SGR = re.compile(r"\x1b\[([0-9;]*)m")
+OSC = re.compile(r"\x1b\](\d+);(?:(\d+);)?rgb:([0-9a-f]{2})/([0-9a-f]{2})/([0-9a-f]{2})")
+
+PERIOD = float(os.environ.get("FF_ANIM_TIME", "4"))
+FPS = 30
+DEPTH = 2.5        # полутолщина плашки (в ширинах клетки)
+LAYERS = 11        # слоёв по глубине для боковых граней
+CAM = 120.0        # дистанция камеры — чем меньше, тем сильнее перспектива
+GAP = 3            # отступ между логотипом и инфой
+PAD = 2            # отступ логотипа слева
+INFO_TOP = 2       # инфа начинается с третьей строки логотипа, как в neofetch
+
+# Палитра по умолчанию; перекрывается цветами темы caelestia
+PALETTE = {0: (0x34, 0x34, 0x34), 1: (0x83, 0x83, 0xFF), 2: (0x44, 0xDE, 0xF5), 3: (0x75, 0xFC, 0xDD),
+           4: (0x7F, 0xB1, 0xCC), 5: (0x85, 0xAB, 0xED), 6: (0x87, 0xD4, 0xEE), 7: (0xCC, 0xDC, 0xD6),
+           "fg": (0xDF, 0xE6, 0xEE)}
+LOGOS = ("arch", "arch_small")  # большой и запасной маленький
+MIRROR = str.maketrans("/\\()", "\\/)(")
+SIDE_CHARS = "░▒▓█"
+
+
+def load_theme():
+    path = os.path.expanduser("~/.local/state/caelestia/sequences.txt")
+    try:
+        data = open(path, encoding="utf-8", errors="ignore").read()
+    except OSError:
+        return
+    for osc, idx, r, g, b in OSC.findall(data):
+        rgb = (int(r, 16), int(g, 16), int(b, 16))
+        if osc == "4" and idx and int(idx) < 8:
+            PALETTE[int(idx)] = rgb
+        elif osc == "10":
+            PALETTE["fg"] = rgb
+
+
+def get_logo(name):
+    """Логотип из fastfetch -> список клеток (x, y, символ, rgb)."""
+    out = subprocess.run(
+        ["fastfetch", "--pipe", "false", "-c", "none", "--logo", name, "-s", "break"],
+        capture_output=True, text=True,
+    ).stdout
+    cells, height, width = [], 0, 0
+    for y, line in enumerate(out.rstrip("\n").split("\n")):
+        color, x = PALETTE["fg"], 0
+        pos = 0
+        for m in list(SGR.finditer(line)) + [None]:
+            text = line[pos:m.start()] if m else line[pos:]
+            for ch in text:
+                if ch != " ":
+                    cells.append((x, y, ch, color))
+                    width = max(width, x + 1)
+                x += 1
+            if m is None:
+                break
+            for code in (m.group(1) or "0").split(";"):
+                if code.isdigit() and (30 <= int(code) <= 37 or 90 <= int(code) <= 97):
+                    color = PALETTE[int(code) % 10]
+                elif code in ("0", ""):
+                    color = PALETTE["fg"]
+            pos = m.end()
+        if x:
+            height = y + 1
+    return cells, width, height
+
+
+def get_info(box):
+    # fish передаёт вывод fastfetch через пайп — тогда в "Shell:" будет fish, а не ff-anim
+    if not sys.stdin.isatty():
+        out = sys.stdin.read()
+    else:
+        out = subprocess.run(
+            ["fastfetch", "--pipe", "false", "-c", "neofetch", "--logo", "none"],
+            capture_output=True, text=True,
+        ).stdout
+    lines = out.rstrip("\n").split("\n")
+    while lines and not SGR.sub("", lines[0]).strip():
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    box.append(lines)
+
+
+def term_size():
+    # Спрашиваем сам терминал: $COLUMNS/$LINES при старте fish бывают устаревшими
+    for fd in (1, 2, 0):
+        try:
+            return os.get_terminal_size(fd)
+        except OSError:
+            pass
+    return shutil.get_terminal_size()
+
+
+def log(msg):
+    try:
+        with open(os.path.expanduser("~/.cache/ff-anim.log"), "a") as f:
+            f.write(time.strftime("%F %T ") + msg + "\n")
+    except OSError:
+        pass
+
+
+# PID fish, который нас запустил; запоминаем до fork — у фонового процесса родитель уже другой
+FISH_PID = os.getppid()
+
+
+def runfile(ext):
+    """Файлы связи с fish: .pid (кто крутит), .fifo (подтверждения), .row (строка курсора)."""
+    base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    return os.path.join(base, "ff-anim-%d.%s" % (FISH_PID, ext))
+
+
+def cursor_row():
+    """Номер строки курсора (с 1) через запрос DSR, или None."""
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR)
+        old = termios.tcgetattr(fd)
+    except (OSError, termios.error):
+        return None
+    new = termios.tcgetattr(fd)
+    new[3] &= ~(termios.ICANON | termios.ECHO)
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+        os.write(fd, b"\x1b[6n")
+        buf, deadline = b"", time.time() + 0.5
+        while not buf.endswith(b"R") and time.time() < deadline:
+            if select.select([fd], [], [], 0.05)[0]:
+                buf += os.read(fd, 32)
+        m = re.search(rb"\x1b\[(\d+);(\d+)R", buf)
+        return int(m.group(1)) if m else None
+    finally:
+        termios.tcsetattr(fd, termios.TCSANOW, old)
+        os.close(fd)
+
+
+class Scene:
+    def __init__(self, cells, width, height):
+        self.w, self.h = width, height
+        self.cx, self.cy = (width - 1) / 2, (height - 1) / 2
+        occupied = {(x, y) for x, y, _, _ in cells}
+        self.points = []  # (x, z, y, символ, rgb, нормаль_x, нормаль_z, тип)
+        zs = [-DEPTH + 2 * DEPTH * i / (LAYERS - 1) for i in range(LAYERS)]
+        for x, y, ch, rgb in cells:
+            for sub in (-0.25, 0.25):
+                self.points.append((x + sub - self.cx, DEPTH, y, ch, rgb, 0.0, 1.0, 0))
+                self.points.append((x + sub - self.cx, -DEPTH, y, ch.translate(MIRROR), rgb, 0.0, -1.0, 0))
+            # Боковые грани строим только у краёв фигуры — внутренние всё равно не видны
+            for nx, edge in ((-1.0, (x - 1, y) not in occupied), (1.0, (x + 1, y) not in occupied)):
+                if edge:
+                    ex = x - self.cx + 0.49 * nx
+                    for z in zs[1:-1]:
+                        self.points.append((ex, z, y, None, rgb, nx, 0.0, 1))
+        # Свет чуть слева-сверху; яркость нормируем так, чтобы анфас давал исходный цвет
+        lx, lz = -0.45, 1.0
+        n = math.hypot(lx, lz)
+        self.light = (lx / n, lz / n)
+        hx, hz = self.light[0], self.light[1] + 1.0
+        n = math.hypot(hx, hz)
+        self.half = (hx / n, hz / n)
+
+    def render(self, angle, persp=1.0):
+        c, s = math.cos(angle), math.sin(angle)
+        lx, lz = self.light
+        hx, hz = self.half
+        base = lz  # освещённость лицевой грани в покое
+        zbuf, frame = {}, {}
+        for px, pz, py, ch, rgb, nx, nz, kind in self.points:
+            xr = px * c + pz * s
+            zr = -px * s + pz * c
+            k = 1 / (1 - persp * zr / CAM)
+            sx = math.floor(self.cx + xr * k + 0.5)
+            sy = math.floor(self.cy + (py - self.cy) * k + 0.5)
+            key = (sx, sy)
+            if zbuf.get(key, -1e9) >= zr:
+                continue
+            zbuf[key] = zr
+            # Нормаль после поворота
+            rnx = nx * c + nz * s
+            rnz = -nx * s + nz * c
+            diff = max(rnx * lx + rnz * lz, 0.0) / base
+            spec = max(rnx * hx + rnz * hz, 0.0) ** 40
+            light = 0.25 + 0.75 * diff
+            if kind:
+                light *= 0.7
+                ch = SIDE_CHARS[min(3, int(max(rnz, 0.0) * 4))]
+            frame[key] = (ch, rgb, light, spec)
+        return frame
+
+
+def shade(rgb, light, spec):
+    return tuple(min(255, int(v * light + (255 - v * light) * spec * 0.9)) for v in rgb)
+
+
+def logo_rows(scene, frame):
+    """Строки области логотипа, включая поля слева и справа (фиксированной ширины)."""
+    out = []
+    for y in range(scene.h):
+        buf, last = [], None
+        for x in range(-PAD, scene.w + GAP - 1):
+            cell = frame.get((x, y))
+            if cell is None:
+                if last is not None:
+                    buf.append("\x1b[0m")
+                    last = None
+                buf.append(" ")
+                continue
+            ch, rgb, light, spec = cell
+            col = shade(rgb, light, spec)
+            if col != last:
+                buf.append("\x1b[1;38;2;%d;%d;%dm" % col)
+                last = col
+            buf.append(ch)
+        buf.append("\x1b[0m")
+        out.append("".join(buf))
+    return out
+
+
+class Stop(Exception):
+    pass
+
+
+class Layout:
+    """Раскладка под конкретный логотип: сцена, строки и статичная картинка."""
+
+    def __init__(self, scene, info_lines):
+        self.scene = scene
+        self.info_lines = info_lines
+        self.info_top = INFO_TOP if INFO_TOP + len(info_lines) <= scene.h else 0
+        self.rows = max(scene.h, self.info_top + len(info_lines))
+        self.frames = [None] * max(1, round(PERIOD * FPS))
+
+    def static_lines(self):
+        """Логотип анфас + инфа; длинные строки обрежет терминал (автоперенос выключаем)."""
+        logo = logo_rows(self.scene, self.scene.render(0.0, 0.0))
+        info_col = PAD + self.scene.w + GAP
+        out = []
+        for row in range(self.rows):
+            line = logo[row] if row < self.scene.h else ""
+            i = row - self.info_top
+            if 0 <= i < len(self.info_lines):
+                line = (line or " " * (info_col - 1)) + " " + self.info_lines[i] + "\x1b[0m"
+            out.append(line + "\x1b[K")
+        return out
+
+    def frame(self, i, top):
+        if self.frames[i] is None:
+            self.frames[i] = self.build(2 * math.pi * i / len(self.frames), 1.0, top)
+        return self.frames[i]
+
+    def build(self, angle, persp, top):
+        rows = logo_rows(self.scene, self.scene.render(angle, persp))
+        body = "".join("\x1b[%d;1H%s" % (top + y, r) for y, r in enumerate(rows))
+        # 2026 — синхронный вывод (без мерцания), ESC7/ESC8 — сохранить/вернуть курсор fish
+        return ("\x1b[?2026h\x1b7" + body + "\x1b8\x1b[?2026l").encode()
+
+
+class Layouts:
+    """Большой и маленький логотип; выбирает тот, что влезает в окно."""
+
+    def __init__(self, logos, info_lines):
+        self.logos = logos
+        self.info_lines = info_lines
+        self.info_w = max((len(SGR.sub("", l)) for l in info_lines), default=0)
+        self.cache = {}
+
+    def fits(self, lg, cols, lines):
+        return lg[0] and PAD + lg[1] + GAP + min(self.info_w, 30) <= cols \
+            and max(lg[2], INFO_TOP + len(self.info_lines)) + 2 <= lines
+
+    def pick(self, cols, lines):
+        for i, lg in enumerate(self.logos):
+            if self.fits(lg, cols, lines):
+                if i not in self.cache:
+                    self.cache[i] = Layout(Scene(*lg), self.info_lines)
+                return self.cache[i]
+        return None
+
+
+def spin(layouts, lay, top, fish_pid):
+    """Фоновый цикл: крутит логотип поверх его места на экране, не трогая курсор fish.
+
+    fish присылает сигналы (см. __ff_anim_call в config.fish) и ждёт ответа через fifo:
+      USR1  — перед командой: ставим логотип анфас и замираем (команда может быть vim/htop);
+      USR2  — перед prompt: fish кладёт в файл .row строку курсора (ff-anim-row);
+              экран не прокрутился — крутим дальше, прокрутился или очищен — логотип
+              уехал, завершаемся;
+      WINCH — Ctrl+L: заново рисуем приветствие сверху.
+    Ресайз окна ловим сами: ждём конца ресайза и тоже рисуем приветствие заново.
+    """
+    fifo = runfile("fifo")
+    try:
+        os.unlink(fifo)
+    except OSError:
+        pass
+    os.mkfifo(fifo, 0o600)
+
+    events = []
+    wake_r, wake_w = os.pipe()
+    os.set_blocking(wake_w, False)
+    signal.set_wakeup_fd(wake_w, warn_on_full_buffer=False)
+    for sig, name in ((signal.SIGTERM, "stop"), (signal.SIGHUP, "stop"), (signal.SIGUSR1, "pause"),
+                      (signal.SIGUSR2, "prompt"), (signal.SIGWINCH, "redraw")):
+        signal.signal(sig, lambda *_, n=name: events.append(n))
+
+    size = term_size()
+    resized_at = None     # время последнего изменения размера (ждём, пока ресайз закончится)
+    paused = False        # идёт команда — логотип стоит анфас
+    paused_size = size
+    dirty = False         # на экране уже есть вывод команд (при перерисовке сохраняем его в истории)
+    start, checked = time.perf_counter(), 0.0
+
+    def ack():
+        # fish ждёт подтверждения не дольше 0.3 с — пишем, как только он откроет fifo
+        deadline = time.time() + 0.3
+        while time.time() < deadline:
+            try:
+                fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError:
+                time.sleep(0.002)
+                continue
+            os.write(fd, b"ok\n")
+            os.close(fd)
+            return
+
+    def front():
+        if lay:
+            os.write(1, lay.build(0.0, 0.0, top))
+
+    def redraw():
+        """Приветствие заново сверху экрана; курсор — под ним, там fish нарисует prompt."""
+        nonlocal lay, top, paused
+        cols, lines = size
+        lay = layouts.pick(cols, lines)
+        if not lay:
+            return
+        # Старое содержимое экрана уходит в историю прокрутки, а не пропадает
+        clear = ("\x1b[%d;1H" % lines + "\n" * lines + "\x1b[H") if dirty else "\x1b[H\x1b[2J\x1b[3J"
+        os.write(1, ("\x1b[?2026h" + clear + "\x1b[?7l" + "\r\n".join(lay.static_lines())
+                     + "\x1b[?7h\r\n\x1b[?2026l").encode())
+        top, paused = 1, False
+        for l in layouts.cache.values():
+            l.frames = [None] * len(l.frames)
+
+    try:
+        while True:
+            while events:
+                ev = events.pop(0)
+                if ev == "stop":
+                    if not paused:
+                        front()
+                    ack()
+                    return
+                if ev == "pause":
+                    if not paused:
+                        front()
+                    dirty = paused = True
+                    paused_size = term_size()
+                    ack()
+                elif ev == "prompt":
+                    size = cur = term_size()
+                    if resized_at is not None or (paused and cur != paused_size):
+                        resized_at = None
+                        redraw()
+                        ack()
+                        continue
+                    try:
+                        row = int(open(runfile("row")).read())
+                    except (OSError, ValueError):
+                        row = None
+                    # Курсор внизу экрана (дальше вывод прокрутит логотип) или над концом
+                    # приветствия (экран очистили) — логотип больше не на своём месте
+                    if row is None or row >= cur.lines or (lay and row < top + lay.rows):
+                        log("stop: row %s, lines %d" % (row, cur.lines))
+                        if not paused:
+                            front()
+                        ack()
+                        return
+                    paused = False
+                    ack()
+                elif ev == "redraw":
+                    redraw()
+                    ack()
+                    os.kill(fish_pid, signal.SIGWINCH)
+
+            now = time.perf_counter() - start
+            if not paused:
+                cur = term_size()
+                if cur != size:
+                    size, resized_at = cur, now
+                if resized_at is not None and now - resized_at > 0.3:
+                    resized_at = None
+                    redraw()
+                    os.kill(fish_pid, signal.SIGWINCH)
+                if lay and resized_at is None:
+                    os.write(1, lay.frame(int(now * FPS) % len(lay.frames), top))
+            if now - checked > 1:
+                checked = now
+                os.kill(fish_pid, 0)  # fish закрыли — выходим
+            delay = (int(now * FPS) + 1) / FPS - (time.perf_counter() - start)
+            if select.select([wake_r], [], [], max(0.0, delay))[0]:
+                os.read(wake_r, 256)
+    except OSError:
+        pass
+    finally:
+        for path in (fifo, runfile("row")):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def kill_old(path):
+    try:
+        os.kill(int(open(path).read()), signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+
+
+def main():
+    if os.environ.get("FF_ANIM") == "0" or not sys.stdout.isatty():
+        os.execvp("fastfetch", ["fastfetch", "-c", "arch-neofetch", "--logo", LOGOS[0]])
+    pid_path = runfile("pid")
+    kill_old(pid_path)
+    load_theme()
+    box = []
+    worker = threading.Thread(target=get_info, args=(box,))
+    worker.start()
+    logos = [get_logo(name) for name in LOGOS]
+    worker.join()
+    layouts = Layouts(logos, box[0])
+
+    # При открытии окна Hyprland может ещё не успеть его растянуть — ждём до 0.6 с
+    deadline = time.perf_counter() + 0.6
+    while True:
+        cols, lines = term_size()
+        lay = layouts.pick(cols, lines)
+        big = lay is not None and lay is layouts.cache.get(0)
+        if big or time.perf_counter() > deadline:
+            break
+        time.sleep(0.03)
+    log("size %dx%d, logo %s" % (cols, lines, "big" if big else "small" if lay else "none"))
+    if lay is None:
+        os.execvp("fastfetch", ["fastfetch", "-c", "arch-neofetch", "--logo", LOGOS[0]])
+
+    w = sys.stdout.write
+    w("\n" * lay.rows + "\x1b[%dA" % lay.rows)
+    sys.stdout.flush()
+    top = cursor_row()
+    w("\x1b[?7l" + "\r" + "\n".join(lay.static_lines()) + "\x1b[?7h\n")
+    sys.stdout.flush()
+
+    # Крутим, только если под картинкой есть место для prompt — иначе экран поедет
+    if top is None or top + lay.rows + 1 >= lines:
+        return
+    fish_pid = FISH_PID
+    if os.fork():
+        return
+    os.setsid()
+    devnull = os.open(os.devnull, os.O_RDWR)
+    os.dup2(devnull, 0)
+    os.dup2(devnull, 2)
+    try:
+        with open(pid_path, "w") as f:
+            f.write(str(os.getpid()))
+        spin(layouts, lay, top, fish_pid)
+    finally:
+        try:
+            if open(pid_path).read() == str(os.getpid()):
+                os.unlink(pid_path)
+        except OSError:
+            pass
+        os._exit(0)
+
+
+if __name__ == "__main__":
+    main()

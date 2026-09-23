@@ -1,0 +1,11 @@
+#!/bin/sh
+# Обёртка над системным gpu-screen-recorder.
+# GTX 1080 Ti (Pascal) застряла на драйвере 580xx с NVENC API 13.0, а системный FFmpeg
+# требует 13.1 — аппаратное кодирование недоступно. Для записи (есть -w) разрешаем
+# откат на кодирование процессором; служебные вызовы (--list-*, --version) идут как есть.
+for arg in "$@"; do
+    if [ "$arg" = "-w" ]; then
+        exec /usr/bin/gpu-screen-recorder -fallback-cpu-encoding yes "$@"
+    fi
+done
+exec /usr/bin/gpu-screen-recorder "$@"

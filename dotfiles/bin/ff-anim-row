@@ -1,0 +1,36 @@
+#!/usr/bin/python3 -IS
+"""Печатает номер строки курсора (с 1) — для ff-anim. Ничего не печатает, если узнать нельзя.
+
+Запускается из fish перед prompt: пока fish ждёт эту команду, он сам не читает ввод,
+так что ответ терминала на запрос DSR достаётся нам целиком.
+"""
+import fcntl
+import os
+import re
+import select
+import struct
+import termios
+import time
+
+try:
+    fd = os.open("/dev/tty", os.O_RDWR)
+    old = termios.tcgetattr(fd)
+except OSError:
+    raise SystemExit(1)
+try:
+    # Пользователь уже что-то напечатал — не трогаем, иначе съедим его символы
+    if struct.unpack("i", fcntl.ioctl(fd, termios.FIONREAD, b"\0" * 4))[0]:
+        raise SystemExit(1)
+    new = termios.tcgetattr(fd)
+    new[3] &= ~(termios.ICANON | termios.ECHO)
+    termios.tcsetattr(fd, termios.TCSANOW, new)
+    os.write(fd, b"\x1b[6n")
+    buf, deadline = b"", time.time() + 0.3
+    while not buf.endswith(b"R") and time.time() < deadline:
+        if select.select([fd], [], [], 0.05)[0]:
+            buf += os.read(fd, 32)
+    m = re.search(rb"\x1b\[(\d+);\d+R", buf)
+    if m:
+        print(int(m.group(1)))
+finally:
+    termios.tcsetattr(fd, termios.TCSANOW, old)
