@@ -75,17 +75,19 @@ for p in "$C/DankMaterialShell/plugins/"*/; do
     rsync -a --exclude .git --exclude 'dist' "$p" "$D/config/DankMaterialShell/plugins/$name/"
 done
 
-# Правки интерфейса DMS поверх dms-qml той же версии
-OVERLAY_FILES=(
-    Modules/Settings/Widgets/SettingsToggleCard.qml
-    Modules/Settings/Widgets/SettingsCard.qml
-    Modules/Settings/DesktopWidgetGroupSection.qml
-    Modules/DankDash/Overview/CalendarOverviewCard.qml
-    Modules/Plugins/BasePill.qml
-    Modules/DankBar/Widgets/LauncherButton.qml
-)
-for f in "${OVERLAY_FILES[@]}"; do
-    copy "$HOME/.local/share/dms-ui/$f" "dms-ui-overlay/$f"
+# Правки интерфейса DMS: всё, чем ~/.local/share/dms-ui отличается от оригинального релиза той же версии
+UI="$HOME/.local/share/dms-ui"
+VER="$(cat "$UI/VERSION")"
+CACHE="$HOME/.cache/newerwindot"
+PRISTINE="$CACHE/dms-qml-$VER"
+if [[ ! -d "$PRISTINE" ]]; then
+    mkdir -p "$PRISTINE"
+    curl -fsSL "https://github.com/AvengeMedia/DankMaterialShell/releases/download/$VER/dms-qml.tar.gz" | tar -xz -C "$PRISTINE"
+fi
+( cd "$UI" && find . -type f ) | while read -r f; do
+    if ! cmp -s "$UI/$f" "$PRISTINE/$f"; then
+        copy "$UI/$f" "dms-ui-overlay/${f#./}"
+    fi
 done
 cp -a "$HOME/.local/share/dms-ui/VERSION" "$D/dms-ui-overlay/VERSION"
 

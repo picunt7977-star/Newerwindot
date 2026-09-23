@@ -73,7 +73,8 @@ Rectangle {
     }
 
     function updateSelectedDateEvents() {
-        const events = (CalendarService && CalendarService.calendarAvailable) ? CalendarService.getEventsForDate(selectedDate) : [];
+        // Локальные задачи показываем и без внешнего календаря (khal/DankCalendar)
+        const events = CalendarService ? CalendarService.getEventsForDate(selectedDate) : [];
         if (JSON.stringify(events) === JSON.stringify(selectedDateEvents))
             return;
         selectedDateEvents = events;
@@ -634,7 +635,7 @@ Rectangle {
                                     anchors.horizontalCenter: parent.horizontalCenter
                                     anchors.bottomMargin: 3
                                     spacing: Theme.spacingXXS
-                                    visible: CalendarService && CalendarService.calendarAvailable && CalendarService.hasEventsForDate(dayDate.toDate())
+                                    visible: CalendarService && CalendarService.hasEventsForDate(dayDate.toDate())
 
                                     Repeater {
                                         model: {

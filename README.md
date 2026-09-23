@@ -7,7 +7,7 @@
 ## Установка (чистая CachyOS / Arch)
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/picun7977-cell/Newerwindot/main/install.sh)
+curl -fsSL https://raw.githubusercontent.com/picun7977-cell/Newerwindot/main/install.sh | bash
 ```
 
 Установщик:
@@ -42,7 +42,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/picun7977-cell/Newerwindot/m
 - `dotfiles/config/caelestia/hypr-user.lua`, `hypr-vars.lua` — наши правки: отступы под панель,
   градиентные рамки в цветах обоев, плавные анимации, постоянные рабочие столы 1–5
 - `dotfiles/config/DankMaterialShell` — настройки панели, виджеты и плагины
-- `dotfiles/dms-ui-overlay` — правки интерфейса DMS: плавная смена месяца и новый вид календаря,
+- `dotfiles/dms-ui-overlay` — правки интерфейса DMS: плавная смена месяца и новый вид календаря, задачи без внешнего календаря,
+  скользящее выделение в лаунчере, анимации дашборда, центр управления без обводок,
   логотип без подложки, исправленная подсветка карточек и выравнивание ручек перетаскивания
 - `dotfiles/config/quickshell/caelestia-shot` — скриншотер caelestia отдельно от её панели
 
